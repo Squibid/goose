@@ -24,8 +24,10 @@ It handles the entire D-Bus stack, from socket communication to type marshaling.
 ### Bus Connection
 
 The `Connection` struct manages the Unix Domain Socket and implements the SASL[^1] `EXTERNAL`
-authentication handshake. It buffers stream data and runs a blocking message loop
-that routes incoming signals and method replies to the appropriate handlers.
+authentication handshake. It supports two concurrency backends:
+
+- **`.threaded` (default)**: Spawns background worker and dispatch threads to handle incoming messages and signals concurrently.
+- **`.poll`**: Single-threaded mode with zero background threads, exposing the socket file descriptor for integration into external event loops.
 
 ### Type System
 
@@ -69,12 +71,28 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
-    // Connect to the session bus
+    // Connect to the session bus (default threaded backend)
     var conn = try goose.Connection.init(allocator, .Session, io, init.environ_map);
     defer conn.close();
 
     // ... use the connection
 }
+```
+
+### Event Loop / Polling Integration (.poll Backend)
+
+For single-threaded architectures that require zero background threads:
+
+```zig
+// Connect with the poll backend (guarantees 0 background threads)
+var conn = try goose.Connection.initWithBackend(allocator, .Session, io, init.environ_map, .poll);
+defer conn.close();
+
+// Retrieve the socket file descriptor for your event loop
+const fd = conn.getFd();
+
+// In your event loop, whenever readability (POLLIN) is detected on fd:
+while (try conn.dispatch()) {}
 ```
 
 ### Calling a Method
