@@ -23,9 +23,7 @@ pub fn Signal(comptime T: type) type {
 
             var encoder = try message.BodyEncoder.encode(conn.__allocator, payload);
             defer encoder.deinit();
-
-            const serial = conn.serial_counter;
-            conn.serial_counter += 1;
+            const serial = conn.nextSerial();
 
             const header = core.MessageHeader{
                 .message_type = .Signal,

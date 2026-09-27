@@ -215,9 +215,7 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
 
                                                 var sig_encoder = try message.BodyEncoder.encode(conn.__allocator, args);
                                                 defer sig_encoder.deinit();
-
-                                                const serial = conn.serial_counter;
-                                                conn.serial_counter += 1;
+                                                const serial = conn.nextSerial();
 
                                                 const sig_header = core.MessageHeader{
                                                     .message_type = .Signal,

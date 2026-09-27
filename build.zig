@@ -90,6 +90,25 @@ pub fn build(b: *std.Build) void {
     const client_step = b.step("test-client", "Run the client test app");
     client_step.dependOn(&run_client.step);
 
+    const concurrency_exe = b.addExecutable(.{
+        .name = "goose-concurrency-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/concurrency_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "goose", .module = mod },
+            },
+        }),
+    });
+
+    const run_concurrency = b.addRunArtifact(concurrency_exe);
+    if (b.args) |args| {
+        run_concurrency.addArgs(args);
+    }
+    const concurrency_step = b.step("test-concurrency", "Run concurrency and lifecycle tests");
+    concurrency_step.dependOn(&run_concurrency.step);
+
     const intro_exe = b.addExecutable(.{
         .name = "goose-introspection",
         .root_module = b.createModule(.{

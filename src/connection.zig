@@ -35,28 +35,88 @@ pub fn MutexMap(comptime K: type, comptime V: type) type {
         }
 
         pub fn deinit(self: *@This()) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.map.deinit();
         }
 
         pub fn put(self: *@This(), key: K, value: V) !void {
-            try self.mutex.lock(self.io);
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             try self.map.put(key, value);
         }
 
         pub fn get(self: *@This(), key: K) ?V {
-            self.mutex.lock(self.io) catch return null;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.map.get(key);
         }
 
         pub fn remove(self: *@This(), key: K) bool {
-            self.mutex.lock(self.io) catch return false;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.map.remove(key);
         }
+
+        pub fn wakeAllWithError(self: *@This()) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var it = self.map.valueIterator();
+            while (it.next()) |pending_ptr| {
+                pending_ptr.*.state.store(@intFromEnum(CallState.err), .release);
+                self.io.futexWake(u32, &pending_ptr.*.state.raw, 1);
+            }
+        }
     };
 }
+
+pub const MessageQueue = struct {
+    list: std.ArrayList(core.Message),
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) @This() {
+        return .{
+            .list = .empty,
+            .io = io,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *@This(), conn: *Connection) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.list.items) |*msg| {
+            conn.freeMessage(msg);
+        }
+        self.list.deinit(self.allocator);
+    }
+
+    pub fn push(self: *@This(), msg: core.Message) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.list.append(self.allocator, msg);
+        self.cond.signal(self.io);
+    }
+
+    pub fn popOrWait(self: *@This(), is_running: *std.atomic.Value(bool)) ?core.Message {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.list.items.len == 0) {
+            if (!is_running.load(.acquire)) return null;
+            self.cond.waitUncancelable(self.io, &self.mutex);
+        }
+        return self.list.orderedRemove(0);
+    }
+
+    pub fn wakeAll(self: *@This()) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.cond.broadcast(self.io);
+    }
+};
 
 /// Specifies the type of D-Bus connection.
 pub const BusType = enum {
@@ -76,15 +136,35 @@ pub const Connection = struct {
     __allocator: std.mem.Allocator,
     __reader_buf: []u8,
     __reader: std.Io.net.Stream.Reader,
-    serial_counter: u32 = 1,
+    serial_counter: std.atomic.Value(u32) = .init(1),
+    write_mutex: std.Io.Mutex = .init,
     pending_calls: MutexMap(u32, *PendingCall),
-    worker_thread: ?std.Thread,
+    dispatch_queue: MessageQueue,
+    worker_init_mutex: std.Io.Mutex = .init,
+    worker_thread: ?std.Thread = null,
+    dispatch_thread: ?std.Thread = null,
     is_running: std.atomic.Value(bool),
-    __is_dummy_futex: std.atomic.Value(u32),
+    serve_futex: std.atomic.Value(u32),
     is_initialized: bool = false,
     signal_handlers_mutex: std.Io.Mutex = .init,
     signal_handlers: std.ArrayList(common.SignalHandler),
     registered_interfaces: std.ArrayList(common.InterfaceWrapper),
+
+    pub fn nextSerial(self: *Connection) u32 {
+        return self.serial_counter.fetchAdd(1, .monotonic);
+    }
+
+    fn writeMessageBytes(self: *Connection, bytes: []const u8) !void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+
+        var writer_buffer: [2048]u8 = undefined;
+        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
+        var io_writer = &writer.interface;
+
+        try io_writer.writeAll(bytes);
+        try io_writer.flush();
+    }
 
     fn auth(self: *Connection) !void {
         var io_reader = &self.__reader.interface;
@@ -173,10 +253,15 @@ pub const Connection = struct {
             .__allocator = allocator,
             .__reader_buf = reader_buf,
             .io = io,
+            .serial_counter = .init(1),
+            .write_mutex = .init,
             .pending_calls = .init(allocator, io),
+            .dispatch_queue = .init(allocator, io),
+            .worker_init_mutex = .init,
             .worker_thread = null,
+            .dispatch_thread = null,
             .is_running = .init(false),
-            .__is_dummy_futex = .init(0),
+            .serve_futex = .init(0),
             .signal_handlers = try .initCapacity(allocator, 0),
             .registered_interfaces = try .initCapacity(allocator, 0),
             .__reader = socket.reader(io, reader_buf),
@@ -194,8 +279,7 @@ pub const Connection = struct {
     }
 
     fn sayHello(self: *Connection) !void {
-        const serial = self.serial_counter;
-        defer self.serial_counter += 1;
+        const serial = self.nextSerial();
 
         const header = core.MessageHeader{
             .message_type = core.MessageType.MethodCall,
@@ -221,17 +305,31 @@ pub const Connection = struct {
         defer self.freeMessage(&response);
     }
 
-    /// This function closes the underlined socket
+    /// This function closes the underlying socket and terminates background threads.
     pub fn close(self: *Connection) void {
         self.is_running.store(false, .release);
+        self.dispatch_queue.wakeAll();
+
         self.__inner_sock.shutdown(self.io, .recv) catch {};
         self.__inner_sock.close(self.io);
+
         if (self.worker_thread) |thread| {
             thread.join();
             self.worker_thread = null;
         }
 
+        if (self.dispatch_thread) |thread| {
+            thread.join();
+            self.dispatch_thread = null;
+        }
+
+        self.serve_futex.store(1, .release);
+        self.io.futexWake(u32, &self.serve_futex.raw, std.math.maxInt(u32));
+
+        self.pending_calls.wakeAllWithError();
         self.pending_calls.deinit();
+        self.dispatch_queue.deinit(self);
+
         self.signal_handlers.deinit(self.__allocator);
 
         for (self.registered_interfaces.items) |*wrapper| {
@@ -254,8 +352,7 @@ pub const Connection = struct {
         const Str = Value.String();
         const U32 = Value.Uint32();
 
-        const serial = self.serial_counter;
-        defer self.serial_counter += 1;
+        const serial = self.nextSerial();
 
         var body_arr = try std.ArrayList(u8).initCapacity(self.__allocator, 256);
         defer body_arr.deinit(self.__allocator);
@@ -303,13 +400,7 @@ pub const Connection = struct {
     pub fn sendMessage(self: *Connection, msg: core.Message) !void {
         var bytes = try msg.pack(self.__allocator);
         defer bytes.deinit(self.__allocator);
-
-        var writer_buffer: [2048]u8 = undefined;
-        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
-        var io_writer = &writer.interface;
-
-        try io_writer.writeAll(bytes.items);
-        try io_writer.flush();
+        try self.writeMessageBytes(bytes.items);
     }
 
     /// Registers an object (interface implementation) at a specific path.
@@ -384,15 +475,15 @@ pub const Connection = struct {
         }
         try reply_fields.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = try self.__allocator.dupeZ(u8, enc.signature()) } });
 
+        const serial = self.nextSerial();
         const reply_h = core.MessageHeader{
             .message_type = .MethodReturn,
             .flags = 0,
             .proto_version = 1,
             .body_length = @intCast(enc.body().len),
-            .serial = self.serial_counter,
+            .serial = serial,
             .header_fields = reply_fields.items,
         };
-        self.serial_counter += 1;
         try self.sendMessage(core.Message.new(reply_h, enc.body()));
     }
 
@@ -427,28 +518,53 @@ pub const Connection = struct {
 
         try reply_fields.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = try self.__allocator.dupeZ(u8, encoder.signature()) } });
 
+        const serial = self.nextSerial();
         const reply_h = core.MessageHeader{
             .message_type = .Error,
             .flags = 0,
             .proto_version = 1,
             .body_length = @intCast(encoder.body().len),
-            .serial = self.serial_counter,
+            .serial = serial,
             .header_fields = reply_fields.items,
         };
-        self.serial_counter += 1;
         try self.sendMessage(core.Message.new(reply_h, encoder.body()));
     }
 
-    /// Runs the main loop, sleeping securely while background thread handles messages.
-    pub fn serve(self: *Connection) !void {
-        if (self.is_initialized and self.worker_thread == null) {
+    pub fn ensureWorkersStarted(self: *Connection) !void {
+        if (self.worker_thread != null) return;
+        self.worker_init_mutex.lockUncancelable(self.io);
+        defer self.worker_init_mutex.unlock(self.io);
+        if (self.worker_thread == null) {
             self.is_running.store(true, .release);
-            self.worker_thread = try std.Thread.spawn(.{}, workerLoop, .{self});
+            const dt = try std.Thread.spawn(.{}, dispatchLoop, .{self});
+            errdefer {
+                self.is_running.store(false, .release);
+                self.dispatch_queue.wakeAll();
+                dt.join();
+            }
+            self.dispatch_thread = dt;
+
+            const wt = try std.Thread.spawn(.{}, workerLoop, .{self});
+            self.worker_thread = wt;
+        }
+    }
+
+    fn dispatchLoop(self: *Connection) void {
+        while (self.is_running.load(.acquire)) {
+            const msg = self.dispatch_queue.popOrWait(&self.is_running) orelse break;
+            self.dispatchUnsolicited(msg) catch {};
+        }
+    }
+
+    /// Runs the main loop, sleeping securely while background threads handle messages.
+    pub fn serve(self: *Connection) !void {
+        if (self.is_initialized) {
+            try self.ensureWorkersStarted();
         }
 
-        self.__is_dummy_futex = std.atomic.Value(u32).init(0);
+        self.serve_futex.store(0, .release);
         while (self.is_running.load(.acquire)) {
-            self.io.futexWaitUncancelable(u32, &self.__is_dummy_futex.raw, 0);
+            self.io.futexWaitUncancelable(u32, &self.serve_futex.raw, 0);
         }
     }
 
@@ -456,7 +572,7 @@ pub const Connection = struct {
         defer self.freeMessage(@constCast(&msg));
 
         if (msg.header.message_type == .Signal) {
-            try self.signal_handlers_mutex.lock(self.io);
+            self.signal_handlers_mutex.lockUncancelable(self.io);
             defer self.signal_handlers_mutex.unlock(self.io);
             for (self.signal_handlers.items) |handler| {
                 if (msg.isSignal(handler.interface, handler.member)) {
@@ -635,8 +751,7 @@ pub const Connection = struct {
         signature: ?[:0]const u8,
         body: []const u8,
     ) !core.Message {
-        const serial = self.serial_counter;
-        defer self.serial_counter += 1;
+        const serial = self.nextSerial();
 
         var fields_list = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 5);
         defer fields_list.deinit(self.__allocator);
@@ -682,7 +797,7 @@ pub const Connection = struct {
 
     /// Registers a callback for a specific D-Bus signal.
     pub fn registerSignalHandler(self: *Connection, interface: []const u8, member: []const u8, callback: *const fn (ctx: ?*anyopaque, msg: core.Message) void, ctx: ?*anyopaque) !void {
-        try self.signal_handlers_mutex.lock(self.io);
+        self.signal_handlers_mutex.lockUncancelable(self.io);
         defer self.signal_handlers_mutex.unlock(self.io);
         try self.signal_handlers.append(self.__allocator, .{
             .interface = interface,
@@ -721,20 +836,18 @@ pub const Connection = struct {
                     self.freeMessage(@constCast(&msg));
                 }
             } else {
-                const Dispatcher = struct {
-                    fn run(conn: *Connection, m: core.Message) void {
-                        conn.dispatchUnsolicited(m) catch {};
-                    }
+                self.dispatch_queue.push(msg) catch |push_err| {
+                    std.debug.print("workerLoop push error: {}\n", .{push_err});
+                    self.freeMessage(@constCast(&msg));
                 };
-                if (std.Thread.spawn(.{}, Dispatcher.run, .{ self, msg })) |t| {
-                    t.detach();
-                } else |spawn_err| {
-                    std.debug.print("Failed to spawn dispatch thread: {}\n", .{spawn_err});
-                    // Fallback to synchronous dispatch
-                    self.dispatchUnsolicited(msg) catch {};
-                }
             }
         }
+
+        self.is_running.store(false, .release);
+        self.pending_calls.wakeAllWithError();
+        self.dispatch_queue.wakeAll();
+        self.serve_futex.store(1, .release);
+        self.io.futexWake(u32, &self.serve_futex.raw, std.math.maxInt(u32));
     }
 
     fn readNextMessage(self: *Connection) !core.Message {
@@ -878,18 +991,13 @@ pub const Connection = struct {
         var pending = PendingCall{};
 
         try self.pending_calls.put(serial, &pending);
+        defer _ = self.pending_calls.remove(serial);
 
-        var writer_buffer: [2048]u8 = undefined;
-        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
-        var io_writer = &writer.interface;
-
-        if (self.is_initialized and self.worker_thread == null) {
-            self.is_running.store(true, .release);
-            self.worker_thread = try std.Thread.spawn(.{}, workerLoop, .{self});
+        if (self.is_initialized) {
+            try self.ensureWorkersStarted();
         }
 
-        try io_writer.writeAll(data);
-        try io_writer.flush();
+        try self.writeMessageBytes(data);
 
         if (self.worker_thread == null) {
             while (true) {
@@ -903,7 +1011,6 @@ pub const Connection = struct {
                         }
                     }
                     if (reply_serial != null and reply_serial.? == serial) {
-                        _ = self.pending_calls.remove(serial);
                         return msg;
                     }
                 }
@@ -915,7 +1022,9 @@ pub const Connection = struct {
             self.io.futexWaitUncancelable(u32, &pending.state.raw, @intFromEnum(CallState.pending));
         }
 
-        _ = self.pending_calls.remove(serial);
+        if (pending.state.load(.acquire) == @intFromEnum(CallState.err)) {
+            return error.ConnectionClosed;
+        }
 
         if (pending.reply) |r| {
             return r;
