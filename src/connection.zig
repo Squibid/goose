@@ -118,6 +118,12 @@ pub const MessageQueue = struct {
     }
 };
 
+/// Defines the concurrency/event-loop model for the connection.
+pub const Backend = enum {
+    threaded,
+    poll,
+};
+
 /// Specifies the type of D-Bus connection.
 pub const BusType = enum {
     /// The session bus (user-specific).
@@ -131,6 +137,7 @@ pub const BusType = enum {
 /// Represents a connection to a D-Bus bus (session or system).
 /// Manages message sending, receiving, and object registration.
 pub const Connection = struct {
+    backend: Backend = .threaded,
     io: std.Io,
     __inner_sock: net.Stream,
     __allocator: std.mem.Allocator,
@@ -152,6 +159,58 @@ pub const Connection = struct {
 
     pub fn nextSerial(self: *Connection) u32 {
         return self.serial_counter.fetchAdd(1, .monotonic);
+    }
+
+    /// Returns the underlying socket file descriptor for integration with external event loops.
+    pub fn getFd(self: *const Connection) std.posix.fd_t {
+        return self.__inner_sock.socket.handle;
+    }
+
+    /// Checks if there is pending data to read, either buffered in user-space or ready in the kernel socket.
+    pub fn hasDataToRead(self: *Connection) bool {
+        if (self.__reader.interface.end > self.__reader.interface.seek) {
+            return true;
+        }
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = self.getFd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const n = std.posix.poll(&pfd, 0) catch return false;
+        return n > 0 and (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+    }
+
+    /// Dispatches a single pending message if available without blocking.
+    /// Returns true if a message was dispatched, false if no data was available.
+    pub fn dispatch(self: *Connection) !bool {
+        if (!self.hasDataToRead()) {
+            return false;
+        }
+
+        const msg = try self.readNextMessage();
+        if (msg.header.message_type == .MethodReturn or msg.header.message_type == .Error) {
+            var reply_serial: ?u32 = null;
+            for (msg.header.header_fields) |f| {
+                if (f.code == .ReplySerial) {
+                    reply_serial = f.value.ReplySerial;
+                    break;
+                }
+            }
+
+            if (reply_serial) |serial| {
+                if (self.pending_calls.get(serial)) |pending| {
+                    pending.reply = msg;
+                    pending.state.store(@intFromEnum(CallState.completed), .release);
+                    self.io.futexWake(u32, &pending.state.raw, 1);
+                    return true;
+                }
+            }
+            self.freeMessage(@constCast(&msg));
+            return true;
+        }
+
+        try self.dispatchUnsolicited(msg);
+        return true;
     }
 
     fn writeMessageBytes(self: *Connection, bytes: []const u8) !void {
@@ -202,11 +261,16 @@ pub const Connection = struct {
         try io_writer.flush();
     }
 
-    /// Initializes a new connection to the D-Bus bus.
+    /// Initializes a new connection to the D-Bus bus using the default threaded backend.
     /// `bus_type`: The type of bus to connect to (.Session, .System, or .Accessibility).
     /// `io`: Mandatory [`std.Io`]
     /// `vars`: Environment variables provided from the entry point
     pub fn init(allocator: std.mem.Allocator, bus_type: BusType, io: std.Io, vars: *std.process.Environ.Map) !Connection {
+        return initWithBackend(allocator, bus_type, io, vars, .threaded);
+    }
+
+    /// Initializes a new connection to the D-Bus bus with the specified backend (.threaded or .poll).
+    pub fn initWithBackend(allocator: std.mem.Allocator, bus_type: BusType, io: std.Io, vars: *std.process.Environ.Map, backend: Backend) !Connection {
         var socket_paths: SocketIterator = undefined;
         var unix_addr: net.UnixAddress = undefined;
         var allocated_path: ?[]u8 = null;
@@ -249,6 +313,7 @@ pub const Connection = struct {
         const socket = try unix_addr.connect(io);
 
         var conn = Connection{
+            .backend = backend,
             .__inner_sock = socket,
             .__allocator = allocator,
             .__reader_buf = reader_buf,
@@ -275,6 +340,7 @@ pub const Connection = struct {
         };
 
         conn.is_initialized = true;
+        conn.is_running.store(true, .release);
         return conn;
     }
 
@@ -531,6 +597,7 @@ pub const Connection = struct {
     }
 
     pub fn ensureWorkersStarted(self: *Connection) !void {
+        if (self.backend != .threaded) return;
         if (self.worker_thread != null) return;
         self.worker_init_mutex.lockUncancelable(self.io);
         defer self.worker_init_mutex.unlock(self.io);
@@ -558,6 +625,9 @@ pub const Connection = struct {
 
     /// Runs the main loop, sleeping securely while background threads handle messages.
     pub fn serve(self: *Connection) !void {
+        if (self.backend == .poll) {
+            return error.InvalidBackend;
+        }
         if (self.is_initialized) {
             try self.ensureWorkersStarted();
         }
@@ -999,8 +1069,11 @@ pub const Connection = struct {
 
         try self.writeMessageBytes(data);
 
-        if (self.worker_thread == null) {
+        if (self.backend == .poll or self.worker_thread == null) {
             while (true) {
+                if (pending.reply) |r| {
+                    return r;
+                }
                 const msg = try self.readNextMessage();
                 if (msg.header.message_type == .MethodReturn or msg.header.message_type == .Error) {
                     var reply_serial: ?u32 = null;
@@ -1013,8 +1086,17 @@ pub const Connection = struct {
                     if (reply_serial != null and reply_serial.? == serial) {
                         return msg;
                     }
+                    if (reply_serial) |rserial| {
+                        if (self.pending_calls.get(rserial)) |p| {
+                            p.reply = msg;
+                            p.state.store(@intFromEnum(CallState.completed), .release);
+                            continue;
+                        }
+                    }
+                    self.freeMessage(@constCast(&msg));
+                    continue;
                 }
-                self.freeMessage(@constCast(&msg));
+                self.dispatchUnsolicited(msg) catch {};
             }
         }
 

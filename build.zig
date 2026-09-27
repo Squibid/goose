@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "goose",
+        .root_module = mod,
+    });
+    b.installArtifact(lib);
+
     const exe = b.addExecutable(.{
         .name = "goose-test",
         .root_module = b.createModule(.{
@@ -150,10 +157,20 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .name = "goose",
     });
 
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
+
+    const docs_step = b.step("docs", "Generate HTML documentation");
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = mod_tests.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+
+    docs_step.dependOn(&docs_install.step);
 }

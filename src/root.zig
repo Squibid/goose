@@ -15,9 +15,9 @@ pub const Property = dbus_types.Property;
 pub const property = dbus_types.property;
 pub const Access = dbus_types.Access;
 
-// Re-export Connection
 pub const Connection = @import("connection.zig").Connection;
 pub const BusType = @import("connection.zig").BusType;
+pub const Backend = @import("connection.zig").Backend;
 pub const SignalHandler = @import("common.zig").SignalHandler;
 
 test {

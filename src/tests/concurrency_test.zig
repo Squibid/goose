@@ -163,5 +163,110 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("PASS: Received {d}/{d} signals strictly in sequence.\n", .{ tracker.count, total_signals });
     }
 
+    std.debug.print("\n=== Test 4: Single-Threaded Poll Backend ===\n", .{});
+    {
+        var conn = try Connection.initWithBackend(allocator, .Session, init.io, init.environ_map, .poll);
+        defer conn.close();
+
+        if (conn.backend != .poll) return error.BackendMismatch;
+        const fd = conn.getFd();
+        if (fd < 0) return error.InvalidFd;
+
+        if (conn.worker_thread != null or conn.dispatch_thread != null) {
+            return error.ThreadSpawnedUnexpectedly;
+        }
+
+        if (conn.serve()) |_| {
+            return error.ServeShouldFailInPollBackend;
+        } else |err| {
+            if (err != error.InvalidBackend) return err;
+        }
+
+        var reply = try conn.methodCall(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetId",
+            null,
+            &.{},
+        );
+        defer conn.freeMessage(&reply);
+
+        var dec = message.BodyDecoder.fromMessage(allocator, reply);
+        const bus_id = try dec.decode(GStr);
+        std.debug.print("Poll Backend Bus ID: {s}\n", .{bus_id.s});
+
+        if (conn.worker_thread != null or conn.dispatch_thread != null) {
+            return error.ThreadSpawnedUnexpectedly;
+        }
+
+        const PollSignalTracker = struct {
+            count: u32 = 0,
+            last_seq: u32 = 0,
+
+            fn callback(ctx_ptr: ?*anyopaque, msg: goose.core.Message) void {
+                const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                var d = message.BodyDecoder.fromMessage(std.heap.page_allocator, msg);
+                const seq = d.decode(u32) catch return;
+                self.count += 1;
+                self.last_seq = seq;
+            }
+        };
+
+        var tracker = PollSignalTracker{};
+        try conn.addMatch("type='signal',interface='dev.goose.test.PollSignals'");
+        try conn.registerSignalHandler("dev.goose.test.PollSignals", "TestSig", PollSignalTracker.callback, &tracker);
+
+        const test_val: u32 = 42;
+        var encoder = try message.BodyEncoder.encode(allocator, test_val);
+        defer encoder.deinit();
+
+        const serial = conn.nextSerial();
+        const header = goose.core.MessageHeader{
+            .message_type = .Signal,
+            .flags = 0,
+            .proto_version = 1,
+            .body_length = @intCast(encoder.body().len),
+            .serial = serial,
+            .header_fields = @constCast(&[_]goose.core.HeaderField{
+                .{ .code = .Path, .value = .{ .Path = "/dev/goose/test/PollSignals" } },
+                .{ .code = .Interface, .value = .{ .Interface = "dev.goose.test.PollSignals" } },
+                .{ .code = .Member, .value = .{ .Member = "TestSig" } },
+                .{ .code = .Signature, .value = .{ .Signature = encoder.signature() } },
+            }),
+        };
+        try conn.sendMessage(goose.core.Message.new(header, encoder.body()));
+
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = conn.getFd(),
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        var polled = false;
+        var retries: usize = 0;
+        while (retries < 100) : (retries += 1) {
+            _ = try std.posix.poll(&pfd, 10);
+            if (pfd[0].revents & std.posix.POLL.IN != 0 or conn.hasDataToRead()) {
+                while (try conn.dispatch()) {}
+                if (tracker.count > 0) {
+                    polled = true;
+                    break;
+                }
+            }
+        }
+
+        if (!polled or tracker.count != 1 or tracker.last_seq != test_val) {
+            std.debug.print("FAIL: Expected 1 signal with val {d}, got count={d}, val={d}\n", .{ test_val, tracker.count, tracker.last_seq });
+            return error.PollDispatchFailed;
+        }
+
+        const has_more = try conn.dispatch();
+        if (has_more) {
+            return error.UnexpectedData;
+        }
+
+        std.debug.print("PASS: Single-threaded poll backend dispatched signal without threads.\n", .{});
+    }
+
     std.debug.print("\nAll concurrency and lifecycle tests passed!\n", .{});
 }
