@@ -342,6 +342,7 @@ pub const MessageHeader = struct {
 pub const Message = struct {
     header: MessageHeader,
     body: []const u8,
+    fds: []const std.posix.fd_t = &.{},
     allocator: ?std.mem.Allocator = null,
 
     /// Creates a new Message.
@@ -349,8 +350,46 @@ pub const Message = struct {
         return Message{
             .header = header,
             .body = body,
+            .fds = &.{},
             .allocator = null,
         };
+    }
+
+    /// Creates a new Message with attached file descriptors.
+    pub fn newWithFds(header: MessageHeader, body: []const u8, fds: []const std.posix.fd_t) Message {
+        return Message{
+            .header = header,
+            .body = body,
+            .fds = fds,
+            .allocator = null,
+        };
+    }
+
+    /// Transfers ownership of the attached file descriptors to the caller.
+    pub fn takeFds(self: *Message, alloc: Allocator) ![]std.posix.fd_t {
+        if (self.fds.len == 0) return &.{};
+
+        for (self.fds) |fd| {
+            if (fd < 0) return error.AlreadyTaken;
+        }
+
+        const result = try alloc.dupe(std.posix.fd_t, self.fds);
+
+        const mutable_fds: []std.posix.fd_t = @constCast(self.fds);
+        for (mutable_fds) |*fd| {
+            fd.* = -1;
+        }
+
+        return result;
+    }
+
+    /// Returns the OS file descriptor corresponding to a D-Bus handle (GUFd index).
+    pub fn getFd(self: Message, ufd: value.GUFd) ?std.posix.fd_t {
+        if (ufd.fd < self.fds.len) {
+            const fd = self.fds[ufd.fd];
+            if (fd >= 0) return fd;
+        }
+        return null;
     }
 
     // pub fn pack(self: Message, allocator: std.mem.Allocator) !std.ArrayList(u8) {

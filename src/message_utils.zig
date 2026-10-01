@@ -255,6 +255,12 @@ pub const BodyDecoder = struct {
                     } else {
                         return T.new(s);
                     }
+                } else if (T == core.value.GUFd) {
+                    self.alignTo(4);
+                    if (self.pos + 4 > self.body.len) return error.EndOfBody;
+                    const val = std.mem.readInt(u32, self.body[self.pos..][0..4], self.endian);
+                    self.pos += 4;
+                    return core.value.GUFd.new(val);
                 }
 
                 // Generic struct/tuple/dict-entry support

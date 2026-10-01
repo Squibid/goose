@@ -134,15 +134,142 @@ pub const BusType = enum {
     Accessibility,
 };
 
+pub const SocketReader = struct {
+    interface: std.Io.Reader,
+    fd: std.posix.fd_t,
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
+    received_fds: std.ArrayList(std.posix.fd_t),
+
+    pub fn init(fd: std.posix.fd_t, allocator: std.mem.Allocator, io: std.Io, buffer: []u8) !SocketReader {
+        return .{
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+            .fd = fd,
+            .allocator = allocator,
+            .mutex = .init,
+            .io = io,
+            .received_fds = try .initCapacity(allocator, 0),
+        };
+    }
+
+    pub fn deinit(self: *SocketReader) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.received_fds.items) |fd| {
+            _ = std.posix.system.close(fd);
+        }
+        self.received_fds.deinit(self.allocator);
+    }
+
+    fn streamImpl(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *SocketReader = @alignCast(@fieldParentPtr("interface", io_r));
+        var iovecs_buffer: [8]std.posix.iovec = undefined;
+        const dest_n, const data_size = try io_r.writableVectorPosix(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+
+        while (true) {
+            const n = self.recvWithIovecs(dest) catch |err| switch (err) {
+                error.WouldBlock => return error.ReadFailed,
+                error.Interrupted => continue,
+                else => return error.ReadFailed,
+            };
+            if (n == 0) return error.EndOfStream;
+
+            if (n > data_size) {
+                self.interface.end += n - data_size;
+                return data_size;
+            }
+            return n;
+        }
+    }
+
+    fn recvWithIovecs(self: *SocketReader, iov: []std.posix.iovec) !usize {
+        const MaxFds = 32;
+        const cmsg_align = @alignOf(usize);
+        const cmsg_hdr_len = comptime std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr), cmsg_align);
+        const CmsgSpace = comptime cmsg_hdr_len + std.mem.alignForward(usize, MaxFds * @sizeOf(std.posix.fd_t), cmsg_align);
+        var cmsg_buf: [CmsgSpace]u8 align(@alignOf(std.c.cmsghdr)) = undefined;
+
+        var msg = std.posix.msghdr{
+            .name = null,
+            .namelen = 0,
+            .iov = iov.ptr,
+            .iovlen = iov.len,
+            .control = &cmsg_buf,
+            .controllen = cmsg_buf.len,
+            .flags = 0,
+        };
+
+        const flags: u32 = if (@hasDecl(std.posix.MSG, "CMSG_CLOEXEC")) std.posix.MSG.CMSG_CLOEXEC else 0;
+        const rc = std.posix.system.recvmsg(self.fd, &msg, flags);
+        const err = std.posix.errno(rc);
+        if (err != .SUCCESS) {
+            if (err == .INTR) return error.Interrupted;
+            if (err == .AGAIN) return error.WouldBlock;
+            return error.ReadFailed;
+        }
+        const bytes_read: usize = @intCast(rc);
+        if (bytes_read == 0) return 0;
+
+        if (msg.controllen >= @sizeOf(std.c.cmsghdr) and msg.control != null) {
+            var offset: usize = 0;
+            while (offset + @sizeOf(std.c.cmsghdr) <= msg.controllen) {
+                const cmsg: *const std.c.cmsghdr = @ptrCast(@alignCast(&cmsg_buf[offset]));
+                if (cmsg.len < @sizeOf(std.c.cmsghdr) or offset + cmsg.len > msg.controllen) break;
+
+                if (cmsg.level == std.posix.SOL.SOCKET and cmsg.type == std.posix.SCM.RIGHTS) {
+                    if (cmsg.len > cmsg_hdr_len) {
+                        const data_len = cmsg.len - cmsg_hdr_len;
+                        const fd_count = data_len / @sizeOf(std.posix.fd_t);
+                        const fds_ptr: [*]const std.posix.fd_t = @ptrCast(@alignCast(&cmsg_buf[offset + cmsg_hdr_len]));
+                        self.mutex.lockUncancelable(self.io);
+                        defer self.mutex.unlock(self.io);
+                        for (0..fd_count) |i| {
+                            const fd = fds_ptr[i];
+                            if (flags == 0) {
+                                _ = std.posix.system.fcntl(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
+                            }
+                            try self.received_fds.append(self.allocator, fd);
+                        }
+                    }
+                }
+
+                const cmsg_aligned = std.mem.alignForward(usize, cmsg.len, cmsg_align);
+                if (cmsg_aligned == 0) break;
+                offset += cmsg_aligned;
+            }
+        }
+        return bytes_read;
+    }
+};
+
 /// Represents a connection to a D-Bus bus (session or system).
 /// Manages message sending, receiving, and object registration.
 pub const Connection = struct {
     backend: Backend = .threaded,
+    supports_unix_fd: bool = false,
     io: std.Io,
     __inner_sock: net.Stream,
     __allocator: std.mem.Allocator,
     __reader_buf: []u8,
-    __reader: std.Io.net.Stream.Reader,
+    __reader: SocketReader,
     serial_counter: std.atomic.Value(u32) = .init(1),
     write_mutex: std.Io.Mutex = .init,
     pending_calls: MutexMap(u32, *PendingCall),
@@ -213,16 +340,80 @@ pub const Connection = struct {
         return true;
     }
 
-    fn writeMessageBytes(self: *Connection, bytes: []const u8) !void {
+    fn sendmsgWithFds(self: *Connection, bytes: []const u8, fds: []const std.posix.fd_t) !void {
+        var iov = [1]std.posix.iovec_const{.{
+            .base = bytes.ptr,
+            .len = bytes.len,
+        }};
+
+        const MaxFds = 32;
+        if (fds.len > MaxFds) return error.TooManyFileDescriptors;
+
+        const cmsg_align = @alignOf(usize);
+        const cmsg_hdr_len = comptime std.mem.alignForward(usize, @sizeOf(std.c.cmsghdr), cmsg_align);
+        const total_cmsg = cmsg_hdr_len + fds.len * @sizeOf(std.posix.fd_t);
+
+        const CmsgSpace = comptime cmsg_hdr_len + std.mem.alignForward(usize, MaxFds * @sizeOf(std.posix.fd_t), cmsg_align);
+        var cmsg_buf: [CmsgSpace]u8 align(@alignOf(std.c.cmsghdr)) = undefined;
+
+        const cmsg: *std.c.cmsghdr = @ptrCast(@alignCast(&cmsg_buf));
+        cmsg.len = @intCast(total_cmsg);
+        cmsg.level = std.posix.SOL.SOCKET;
+        cmsg.type = std.posix.SCM.RIGHTS;
+
+        const fds_dest: [*]std.posix.fd_t = @ptrCast(@alignCast(&cmsg_buf[cmsg_hdr_len]));
+        for (fds, 0..) |f, i| {
+            fds_dest[i] = f;
+        }
+
+        var msg = std.posix.msghdr_const{
+            .name = null,
+            .namelen = 0,
+            .iov = &iov,
+            .iovlen = 1,
+            .control = &cmsg_buf,
+            .controllen = total_cmsg,
+            .flags = 0,
+        };
+
+        var sent_total: usize = 0;
+        while (sent_total < bytes.len) {
+            if (sent_total > 0) {
+                msg.control = null;
+                msg.controllen = 0;
+            }
+            iov[0].base = bytes.ptr + sent_total;
+            iov[0].len = bytes.len - sent_total;
+
+            const rc = std.posix.system.sendmsg(self.getFd(), &msg, 0);
+            const err = std.posix.errno(rc);
+            if (err != .SUCCESS) {
+                if (err == .INTR) continue;
+                if (err == .AGAIN) continue;
+                return error.WriteFailed;
+            }
+            sent_total += @intCast(rc);
+        }
+    }
+
+    fn writeMessageBytesWithFds(self: *Connection, bytes: []const u8, fds: []const std.posix.fd_t) !void {
         self.write_mutex.lockUncancelable(self.io);
         defer self.write_mutex.unlock(self.io);
 
-        var writer_buffer: [2048]u8 = undefined;
-        var writer = self.__inner_sock.writer(self.io, &writer_buffer);
-        var io_writer = &writer.interface;
+        if (fds.len > 0) {
+            try self.sendmsgWithFds(bytes, fds);
+        } else {
+            var writer_buffer: [2048]u8 = undefined;
+            var writer = self.__inner_sock.writer(self.io, &writer_buffer);
+            var io_writer = &writer.interface;
 
-        try io_writer.writeAll(bytes);
-        try io_writer.flush();
+            try io_writer.writeAll(bytes);
+            try io_writer.flush();
+        }
+    }
+
+    fn writeMessageBytes(self: *Connection, bytes: []const u8) !void {
+        try self.writeMessageBytesWithFds(bytes, &.{});
     }
 
     fn auth(self: *Connection) !void {
@@ -232,7 +423,7 @@ pub const Connection = struct {
         var writer = self.__inner_sock.writer(self.io, &writer_buffer);
         var io_writer = &writer.interface;
 
-        const uid: u32 = std.os.linux.getuid();
+        const uid: u32 = @intCast(std.posix.system.getuid());
         var uid_buf: [32]u8 = undefined;
         const uid_str = try std.fmt.bufPrint(&uid_buf, "{}", .{uid});
 
@@ -255,6 +446,16 @@ pub const Connection = struct {
         const response = try io_reader.takeDelimiterInclusive('\n');
         if (!std.mem.startsWith(u8, response, "OK")) {
             return error.HandshakeFail;
+        }
+
+        try io_writer.print("NEGOTIATE_UNIX_FD\r\n", .{});
+        try io_writer.flush();
+
+        const fd_response = try io_reader.takeDelimiterInclusive('\n');
+        if (std.mem.startsWith(u8, fd_response, "AGREE_UNIX_FD")) {
+            self.supports_unix_fd = true;
+        } else {
+            self.supports_unix_fd = false;
         }
 
         try io_writer.print("BEGIN\r\n", .{});
@@ -293,7 +494,7 @@ pub const Connection = struct {
                 if (vars.get("AT_SPI_BUS_ADDRESS")) |addr| {
                     socket_paths = .init(addr);
                 } else {
-                    const uid = std.os.linux.getuid();
+                    const uid = std.posix.system.getuid();
                     allocated_path = try std.fmt.allocPrint(allocator, "unix:path=/run/user/{d}/at-spi/bus_0", .{uid});
                     socket_paths = .init(allocated_path.?);
                 }
@@ -314,6 +515,7 @@ pub const Connection = struct {
 
         var conn = Connection{
             .backend = backend,
+            .supports_unix_fd = false,
             .__inner_sock = socket,
             .__allocator = allocator,
             .__reader_buf = reader_buf,
@@ -329,7 +531,7 @@ pub const Connection = struct {
             .serve_futex = .init(0),
             .signal_handlers = try .initCapacity(allocator, 0),
             .registered_interfaces = try .initCapacity(allocator, 0),
-            .__reader = socket.reader(io, reader_buf),
+            .__reader = try SocketReader.init(socket.socket.handle, allocator, io, reader_buf),
         };
 
         try conn.auth();
@@ -403,6 +605,7 @@ pub const Connection = struct {
         }
         self.registered_interfaces.deinit(self.__allocator);
 
+        self.__reader.deinit();
         self.__allocator.free(self.__reader_buf);
     }
 
@@ -464,9 +667,30 @@ pub const Connection = struct {
 
     /// Sends a D-Bus message over the connection.
     pub fn sendMessage(self: *Connection, msg: core.Message) !void {
-        var bytes = try msg.pack(self.__allocator);
+        var msg_to_pack = msg;
+        var header_fields_copy: ?std.ArrayList(core.HeaderField) = null;
+        defer if (header_fields_copy) |*hfc| hfc.deinit(self.__allocator);
+
+        if (msg.fds.len > 0) {
+            var has_unix_fds = false;
+            for (msg.header.header_fields) |f| {
+                if (f.code == .UnixFds) {
+                    has_unix_fds = true;
+                    break;
+                }
+            }
+            if (!has_unix_fds) {
+                var fields = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, msg.header.header_fields.len + 1);
+                try fields.appendSlice(self.__allocator, msg.header.header_fields);
+                try fields.append(self.__allocator, .{ .code = .UnixFds, .value = .{ .UnixFds = @intCast(msg.fds.len) } });
+                msg_to_pack.header.header_fields = fields.items;
+                header_fields_copy = fields;
+            }
+        }
+
+        var bytes = try msg_to_pack.pack(self.__allocator);
         defer bytes.deinit(self.__allocator);
-        try self.writeMessageBytes(bytes.items);
+        try self.writeMessageBytesWithFds(bytes.items, msg.fds);
     }
 
     /// Registers an object (interface implementation) at a specific path.
@@ -551,6 +775,46 @@ pub const Connection = struct {
             .header_fields = reply_fields.items,
         };
         try self.sendMessage(core.Message.new(reply_h, enc.body()));
+    }
+
+    /// Sends a reply to a method call passing file descriptors.
+    pub fn sendReplyWithFds(self: *Connection, m: core.Message, enc: message.BodyEncoder, fds: []const std.posix.fd_t) !void {
+        var reply_fields = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 4);
+        defer {
+            for (reply_fields.items) |f| {
+                switch (f.value) {
+                    .Destination, .Signature => |s| self.__allocator.free(s),
+                    else => {},
+                }
+            }
+            reply_fields.deinit(self.__allocator);
+        }
+        try reply_fields.append(self.__allocator, .{ .code = .ReplySerial, .value = .{ .ReplySerial = m.header.serial } });
+
+        var dst: ?[:0]const u8 = null;
+        for (m.header.header_fields) |f| if (f.code == .Sender) {
+            dst = f.value.Sender;
+        };
+        if (dst) |d| {
+            try reply_fields.append(self.__allocator, .{ .code = .Destination, .value = .{ .Destination = try self.__allocator.dupeZ(u8, d) } });
+        } else {
+            std.debug.print("WARN: No Sender in request, reply has no Destination!\n", .{});
+        }
+        try reply_fields.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = try self.__allocator.dupeZ(u8, enc.signature()) } });
+        if (fds.len > 0) {
+            try reply_fields.append(self.__allocator, .{ .code = .UnixFds, .value = .{ .UnixFds = @intCast(fds.len) } });
+        }
+
+        const serial = self.nextSerial();
+        const reply_h = core.MessageHeader{
+            .message_type = .MethodReturn,
+            .flags = 0,
+            .proto_version = 1,
+            .body_length = @intCast(enc.body().len),
+            .serial = serial,
+            .header_fields = reply_fields.items,
+        };
+        try self.sendMessage(core.Message.newWithFds(reply_h, enc.body(), fds));
     }
 
     /// Sends an Error reply to a message.
@@ -822,9 +1086,23 @@ pub const Connection = struct {
         signature: ?[:0]const u8,
         body: []const u8,
     ) !core.Message {
+        return self.methodCallWithFds(dest, path, iface, member, signature, body, &.{});
+    }
+
+    /// Performs a synchronous D-Bus method call passing file descriptors.
+    pub fn methodCallWithFds(
+        self: *Connection,
+        dest: [:0]const u8,
+        path: [:0]const u8,
+        iface: [:0]const u8,
+        member: [:0]const u8,
+        signature: ?[:0]const u8,
+        body: []const u8,
+        fds: []const std.posix.fd_t,
+    ) !core.Message {
         const serial = self.nextSerial();
 
-        var fields_list = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 5);
+        var fields_list = try std.ArrayList(core.HeaderField).initCapacity(self.__allocator, 6);
         defer fields_list.deinit(self.__allocator);
 
         try fields_list.append(self.__allocator, .{ .code = .Destination, .value = .{ .Destination = dest } });
@@ -834,6 +1112,9 @@ pub const Connection = struct {
 
         if (signature) |sig| {
             try fields_list.append(self.__allocator, .{ .code = .Signature, .value = .{ .Signature = sig } });
+        }
+        if (fds.len > 0) {
+            try fields_list.append(self.__allocator, .{ .code = .UnixFds, .value = .{ .UnixFds = @intCast(fds.len) } });
         }
 
         const header = core.MessageHeader{
@@ -845,11 +1126,11 @@ pub const Connection = struct {
             .header_fields = fields_list.items,
         };
 
-        const msg = core.Message.new(header, body);
+        const msg = core.Message.newWithFds(header, body, fds);
         var bytes = try msg.pack(self.__allocator);
         defer bytes.deinit(self.__allocator);
 
-        return self.call(bytes.items, serial);
+        return self.callWithFds(bytes.items, serial, fds);
     }
 
     /// Frees resources associated with a message.
@@ -864,6 +1145,18 @@ pub const Connection = struct {
             }
         }
         self.__allocator.free(msg.header.header_fields);
+
+        if (msg.allocator != null) {
+            for (msg.fds) |fd| {
+                if (fd >= 0) {
+                    _ = std.posix.system.close(fd);
+                }
+            }
+            if (msg.fds.len > 0) {
+                self.__allocator.free(msg.fds);
+            }
+        }
+        msg.fds = &.{};
     }
 
     /// Registers a callback for a specific D-Bus signal.
@@ -1032,6 +1325,39 @@ pub const Connection = struct {
             }
         }
 
+        var unix_fds_count: u32 = 0;
+        for (fields_list.items) |f| {
+            if (f.code == .UnixFds) {
+                unix_fds_count = f.value.UnixFds;
+                break;
+            }
+        }
+
+        const header_fields = try fields_list.toOwnedSlice(self.__allocator);
+        errdefer self.__allocator.free(header_fields);
+
+        var msg_fds: []std.posix.fd_t = &.{};
+        if (unix_fds_count > 0) {
+            msg_fds = try self.__allocator.alloc(std.posix.fd_t, unix_fds_count);
+            var fds_taken: usize = 0;
+            errdefer {
+                for (msg_fds[0..fds_taken]) |fd| {
+                    _ = std.posix.system.close(fd);
+                }
+                self.__allocator.free(msg_fds);
+            }
+            self.__reader.mutex.lockUncancelable(self.io);
+            defer self.__reader.mutex.unlock(self.io);
+            for (0..unix_fds_count) |i| {
+                if (self.__reader.received_fds.items.len > 0) {
+                    msg_fds[i] = self.__reader.received_fds.orderedRemove(0);
+                    fds_taken += 1;
+                } else {
+                    return error.MissingUnixFds;
+                }
+            }
+        }
+
         return core.Message{
             .header = .{
                 .endianess = endian,
@@ -1040,9 +1366,10 @@ pub const Connection = struct {
                 .proto_version = version,
                 .body_length = body_len,
                 .serial = msg_serial,
-                .header_fields = try fields_list.toOwnedSlice(self.__allocator),
+                .header_fields = header_fields,
             },
             .body = body,
+            .fds = msg_fds,
             .allocator = self.__allocator,
         };
     }
@@ -1059,6 +1386,10 @@ pub const Connection = struct {
     }
 
     fn call(self: *Connection, data: []u8, serial: u32) !core.Message {
+        return self.callWithFds(data, serial, &.{});
+    }
+
+    fn callWithFds(self: *Connection, data: []u8, serial: u32, fds: []const std.posix.fd_t) !core.Message {
         var pending = PendingCall{};
 
         try self.pending_calls.put(serial, &pending);
@@ -1068,7 +1399,7 @@ pub const Connection = struct {
             try self.ensureWorkersStarted();
         }
 
-        try self.writeMessageBytes(data);
+        try self.writeMessageBytesWithFds(data, fds);
 
         if (self.backend == .poll or self.worker_thread == null) {
             while (true) {

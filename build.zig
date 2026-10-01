@@ -116,6 +116,25 @@ pub fn build(b: *std.Build) void {
     const concurrency_step = b.step("test-concurrency", "Run concurrency and lifecycle tests");
     concurrency_step.dependOn(&run_concurrency.step);
 
+    const fd_exe = b.addExecutable(.{
+        .name = "goose-unix-fd-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/unix_fd_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "goose", .module = mod },
+            },
+        }),
+    });
+
+    const run_fd = b.addRunArtifact(fd_exe);
+    if (b.args) |args| {
+        run_fd.addArgs(args);
+    }
+    const fd_step = b.step("test-fd", "Run UNIX file descriptor passing tests");
+    fd_step.dependOn(&run_fd.step);
+
     const intro_exe = b.addExecutable(.{
         .name = "goose-introspection",
         .root_module = b.createModule(.{
