@@ -704,6 +704,7 @@ pub const Connection = struct {
                     // Wrap up the XML
                     try intro_interfaces.appendSlice(self.__allocator, xml_generator.xml_postlude);
                     const xml = try intro_interfaces.toOwnedSliceSentinel(self.__allocator, 0);
+                    defer self.__allocator.free(xml);
 
                     var encoder = try message.BodyEncoder.encode(self.__allocator, GStr.new(xml));
                     defer encoder.deinit();
