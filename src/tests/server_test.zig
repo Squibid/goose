@@ -6,8 +6,8 @@ const GStr = goose.core.value.GStr;
 
 const MyInterface = struct {
     conn: *Connection,
-    ThisIsAProps: goose.Property(i32, .ReadWrite) = goose.property(i32, .ReadWrite, 43),
-    thisIsAsignal: goose.Signal(GStr) = signal("thisIsAsignal", GStr),
+    ThisIsAProps: goose.Property(i32, .ReadWrite) = .init(43),
+    thisIsAsignal: goose.Signal(GStr) = .init("thisIsAsignal"),
 
     pub const INTERFACE_NAME = "dev.myinterface.test";
 

@@ -14,6 +14,10 @@ pub fn Signal(comptime T: type) type {
         pub const __is_goose_signal = true;
         pub const PayloadType = T;
 
+        pub fn init(name: [:0]const u8) @This() {
+            return .{ .name = name };
+        }
+
         /// Triggers a signal.
         /// `conn`: The connection to send the signal on.
         /// `payload`: The payload matching the signal's type.
@@ -60,6 +64,10 @@ pub fn Property(comptime T: type, comptime access_mode: Access) type {
         pub const __is_goose_property = true;
         pub const DataType = T;
         pub const AccessMode = access_mode;
+
+        pub fn init(value: T) @This() {
+            return .{ .value = value };
+        }
     };
 }
 
