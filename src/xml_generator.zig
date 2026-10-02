@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const Value = core.value.Value;
+const Connection = @import("connection.zig").Connection;
 
 pub const xml_prelude =
     \\<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
@@ -60,6 +61,7 @@ pub fn generateIntrospectionXml(allocator: std.mem.Allocator, comptime T: type, 
                     // Args (skip first which is self)
                     inline for (fn_info.params[1..], 0..) |param, i| {
                         if (param.type) |PT| {
+                            if (PT == core.Message or PT == *Connection) continue;
                             const sig = try getSignature(allocator, PT);
                             defer allocator.free(sig);
                             try out.print(allocator, "      <arg name=\"arg{d}\" type=\"{s}\" direction=\"in\"/>\n", .{ i, sig });

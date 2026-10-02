@@ -268,7 +268,13 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                 args[0] = self_obj;
 
                                 inline for (fn_info.params[1..], 1..) |param, i| {
-                                    args[i] = try decoder.decode(param.type.?);
+                                    if (param.type.? == core.Message) {
+                                        args[i] = msg;
+                                    } else if (param.type.? == *Connection) {
+                                        args[i] = conn;
+                                    } else {
+                                        args[i] = try decoder.decode(param.type.?);
+                                    }
                                 }
 
                                 const result = try @call(.auto, field_val, args);
