@@ -54,7 +54,7 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                     }
                 }
 
-                if (count == 0) break :blk union { _dummy: void };
+                if (count == 0) break :blk union(enum) { _dummy: u8 };
 
                 const c = count;
 
@@ -277,11 +277,23 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                     }
                                 }
 
-                                const result = try @call(.auto, field_val, args);
-                                var encoder = try message.BodyEncoder.encode(conn.__allocator, result);
-                                defer encoder.deinit();
-                                try conn.sendReply(msg, encoder);
-                                return .dispatched;
+                                const RetType = fn_info.return_type orelse void;
+                                if (@typeInfo(RetType) == .error_union) {
+                                    const result = @call(.auto, field_val, args) catch |err| {
+                                        try conn.sendError(msg, "org.freedesktop.DBus.Error.Failed", @errorName(err));
+                                        return .dispatched;
+                                    };
+                                    var encoder = try message.BodyEncoder.encode(conn.__allocator, result);
+                                    defer encoder.deinit();
+                                    try conn.sendReply(msg, encoder);
+                                    return .dispatched;
+                                } else {
+                                    const result = @call(.auto, field_val, args);
+                                    var encoder = try message.BodyEncoder.encode(conn.__allocator, result);
+                                    defer encoder.deinit();
+                                    try conn.sendReply(msg, encoder);
+                                    return .dispatched;
+                                }
                             }
                         }
                     }
