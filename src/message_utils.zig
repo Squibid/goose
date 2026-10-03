@@ -78,6 +78,7 @@ pub const BodyDecoder = struct {
     pos: usize,
     sig_pos: usize,
     endian: std.builtin.Endian,
+    fds: []const std.posix.fd_t = &.{},
 
     /// Initializes a decoder with raw body and signature.
     pub fn init(allocator: std.mem.Allocator, body: []const u8, signature: []const u8, endian: std.builtin.Endian) BodyDecoder {
@@ -88,6 +89,20 @@ pub const BodyDecoder = struct {
             .pos = 0,
             .sig_pos = 0,
             .endian = endian,
+            .fds = &.{},
+        };
+    }
+
+    /// Initializes a decoder with raw body, signature, and out-of-band file descriptors.
+    pub fn initWithFds(allocator: std.mem.Allocator, body: []const u8, signature: []const u8, endian: std.builtin.Endian, fds: []const std.posix.fd_t) BodyDecoder {
+        return .{
+            .allocator = allocator,
+            .body = body,
+            .signature = signature,
+            .pos = 0,
+            .sig_pos = 0,
+            .endian = endian,
+            .fds = fds,
         };
     }
 
@@ -108,6 +123,7 @@ pub const BodyDecoder = struct {
             .pos = 0,
             .sig_pos = 0,
             .endian = msg.header.endianess,
+            .fds = msg.fds,
         };
     }
 
@@ -261,6 +277,15 @@ pub const BodyDecoder = struct {
                     const val = std.mem.readInt(u32, self.body[self.pos..][0..4], self.endian);
                     self.pos += 4;
                     return core.value.GUFd.new(val);
+                } else if (T == core.value.ResolvedFd) {
+                    self.alignTo(4);
+                    if (self.pos + 4 > self.body.len) return error.EndOfBody;
+                    const idx = std.mem.readInt(u32, self.body[self.pos..][0..4], self.endian);
+                    self.pos += 4;
+                    if (idx >= self.fds.len) return error.MissingUnixFds;
+                    const os_fd = self.fds[idx];
+                    if (os_fd < 0) return error.AlreadyTaken;
+                    return core.value.ResolvedFd.init(os_fd, idx);
                 }
 
                 // Generic struct/tuple/dict-entry support
@@ -549,3 +574,43 @@ pub const BodyDecoder = struct {
         }
     }
 };
+
+test "BodyEncoder and BodyDecoder ResolvedFd and []ResolvedFd" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const mock_fds = [_]std.posix.fd_t{ 42, 84 };
+    var enc1 = try BodyEncoder.encode(allocator, core.value.GUFd.new(1));
+    defer enc1.deinit();
+
+    try testing.expectEqualStrings("h", enc1.signature());
+
+    var dec1 = BodyDecoder.initWithFds(allocator, enc1.body(), enc1.signature(), .little, &mock_fds);
+    const rfd = try dec1.decode(core.value.ResolvedFd);
+    try testing.expectEqual(@as(u32, 1), rfd.index);
+    try testing.expectEqual(@as(std.posix.fd_t, 84), rfd.handle);
+
+    const fd_indices = [_]core.value.ResolvedFd{
+        core.value.ResolvedFd.init(-1, 0),
+        core.value.ResolvedFd.init(-1, 1),
+    };
+    var enc2 = try BodyEncoder.encode(allocator, &fd_indices);
+    defer enc2.deinit();
+
+    try testing.expectEqualStrings("ah", enc2.signature());
+
+    var dec2 = BodyDecoder.initWithFds(allocator, enc2.body(), enc2.signature(), .little, &mock_fds);
+    const resolved_slice = try dec2.decode([]core.value.ResolvedFd);
+    defer allocator.free(resolved_slice);
+
+    try testing.expectEqual(@as(usize, 2), resolved_slice.len);
+    try testing.expectEqual(@as(u32, 0), resolved_slice[0].index);
+    try testing.expectEqual(@as(std.posix.fd_t, 42), resolved_slice[0].handle);
+    try testing.expectEqual(@as(u32, 1), resolved_slice[1].index);
+    try testing.expectEqual(@as(std.posix.fd_t, 84), resolved_slice[1].handle);
+
+    var enc3 = try BodyEncoder.encode(allocator, core.value.GUFd.new(5));
+    defer enc3.deinit();
+    var dec3 = BodyDecoder.initWithFds(allocator, enc3.body(), enc3.signature(), .little, &mock_fds);
+    try testing.expectError(error.MissingUnixFds, dec3.decode(core.value.ResolvedFd));
+}

@@ -267,14 +267,29 @@ pub fn getDispatchFn(comptime T: type) fn (*const common.InterfaceWrapper, *Conn
                                 var args: ArgsType = undefined;
                                 args[0] = self_obj;
 
+                                var decoded_count: usize = 0;
+                                defer {
+                                    inline for (fn_info.params[1..], 1..) |param, i| {
+                                        const PT = param.type.?;
+                                        if (@typeInfo(PT) == .pointer and @typeInfo(PT).pointer.size == .slice) {
+                                            if (i <= decoded_count) {
+                                                conn.__allocator.free(args[i]);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 inline for (fn_info.params[1..], 1..) |param, i| {
                                     if (param.type.? == core.Message) {
                                         args[i] = msg;
+                                    } else if (param.type.? == *const core.Message or param.type.? == *core.Message) {
+                                        args[i] = &msg;
                                     } else if (param.type.? == *Connection) {
                                         args[i] = conn;
                                     } else {
                                         args[i] = try decoder.decode(param.type.?);
                                     }
+                                    decoded_count = i;
                                 }
 
                                 const RetType = fn_info.return_type orelse void;

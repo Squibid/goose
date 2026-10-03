@@ -46,7 +46,7 @@ pub const DBusWriter = struct {
 pub fn dbusAlignOf(comptime T: type) usize {
     if (T == GStr or T == GPath) return 4; // 's','o'
     if (T == GSig) return 1; // 'g'
-    if (T == GUFd) return 4; // 'h'
+    if (T == GUFd or T == ResolvedFd) return 4; // 'h'
     if (T == GVariant) return 1; // 'v'
     if (comptime Value.isDict(T)) return 4; // 'a'
 
@@ -115,6 +115,24 @@ pub const GUFd = struct {
     /// Creates a new GUFd from a file descriptor.
     pub fn new(fd: u32) @This() {
         return .{ .fd = fd };
+    }
+};
+
+/// A resolved file descriptor providing the active OS descriptor handle and D-Bus wire index.
+pub const ResolvedFd = struct {
+    handle: std.posix.fd_t,
+    index: u32 = 0,
+
+    pub fn init(handle: std.posix.fd_t, index: u32) @This() {
+        return .{ .handle = handle, .index = index };
+    }
+
+    /// Duplicates the file descriptor with O_CLOEXEC for persistent use beyond the request/method scope.
+    pub fn duplicate(self: ResolvedFd) !std.posix.fd_t {
+        const new_fd = std.posix.system.fcntl(self.handle, std.posix.F.DUPFD_CLOEXEC, 0);
+        const err = std.posix.errno(new_fd);
+        if (err != .SUCCESS) return error.DupFailed;
+        return @intCast(new_fd);
     }
 };
 
@@ -239,7 +257,7 @@ pub const Value = struct {
             },
             else => {},
         }
-        if (T == GStr or T == GPath or T == GSig or T == GUFd or T == GVariant) return 1;
+        if (T == GStr or T == GPath or T == GSig or T == GUFd or T == ResolvedFd or T == GVariant) return 1;
         if (comptime isDict(T)) {
             const kv = dictKV(T);
             return 3 + dictKeyReprLen(kv.key) + reprLength(kv.val);
@@ -297,7 +315,7 @@ pub const Value = struct {
         } else if (T == GSig) {
             xs[real_start] = 'g';
             return;
-        } else if (T == GUFd) {
+        } else if (T == GUFd or T == ResolvedFd) {
             xs[real_start] = 'h';
             return;
         } else if (T == GVariant) {
@@ -394,7 +412,7 @@ pub const Value = struct {
             pub fn new(xs: []const T) Self {
                 return Self{
                     .inner = xs,
-                    .repr = &rr,
+                    .repr = SIGNATURE,
                 };
             }
 
@@ -782,6 +800,9 @@ pub const Serializer = struct {
         } else if (T == GUFd) {
             try Value.UnixFd().new(data.fd).ser(w);
             return;
+        } else if (T == ResolvedFd) {
+            try Value.UnixFd().new(data.index).ser(w);
+            return;
         }
 
         switch (@typeInfo(T)) {
@@ -896,9 +917,29 @@ test "Signature Generation test" {
     Value.getRepr(MapT, repr_len, 0, repr_buf[0..repr_len]);
     try testing.expect(eql(u8, repr_buf[0..repr_len], "a{sd}"));
 
-    const IntMapT = std.AutoHashMap(u32, Value.GStr);
+    const IntMapT = std.AutoHashMap(u32, GStr);
     const int_repr_len = Value.reprLength(IntMapT);
     var int_repr_buf: [10]u8 = undefined;
     Value.getRepr(IntMapT, int_repr_len, 0, int_repr_buf[0..int_repr_len]);
     try testing.expect(eql(u8, int_repr_buf[0..int_repr_len], "a{us}"));
+}
+
+test "ResolvedFd signature and alignment" {
+    const testing = std.testing;
+    const eql = std.mem.eql;
+    try testing.expect(dbusAlignOf(ResolvedFd) == 4);
+    try testing.expect(Value.reprLength(ResolvedFd) == 1);
+    var repr_buf: [10]u8 = undefined;
+    Value.getRepr(ResolvedFd, 1, 0, repr_buf[0..1]);
+    try testing.expect(eql(u8, repr_buf[0..1], "h"));
+
+    try testing.expect(dbusAlignOf([]const ResolvedFd) == 4);
+    try testing.expect(Value.reprLength([]const ResolvedFd) == 2);
+    Value.getRepr([]const ResolvedFd, 2, 0, repr_buf[0..2]);
+    try testing.expect(eql(u8, repr_buf[0..2], "ah"));
+
+    try testing.expect(dbusAlignOf([]ResolvedFd) == 4);
+    try testing.expect(Value.reprLength([]ResolvedFd) == 2);
+    Value.getRepr([]ResolvedFd, 2, 0, repr_buf[0..2]);
+    try testing.expect(eql(u8, repr_buf[0..2], "ah"));
 }

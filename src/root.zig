@@ -15,6 +15,9 @@ pub const Property = dbus_types.Property;
 pub const property = dbus_types.property;
 pub const Access = dbus_types.Access;
 
+pub const GUFd = core.value.GUFd;
+pub const ResolvedFd = core.value.ResolvedFd;
+
 pub const Connection = @import("connection.zig").Connection;
 pub const BusType = @import("connection.zig").BusType;
 pub const Backend = @import("connection.zig").Backend;

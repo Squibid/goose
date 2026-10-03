@@ -61,7 +61,7 @@ pub fn generateIntrospectionXml(allocator: std.mem.Allocator, comptime T: type, 
                     // Args (skip first which is self)
                     inline for (fn_info.params[1..], 0..) |param, i| {
                         if (param.type) |PT| {
-                            if (PT == core.Message or PT == *Connection) continue;
+                            if (PT == core.Message or PT == *const core.Message or PT == *core.Message or PT == *Connection) continue;
                             const sig = try getSignature(allocator, PT);
                             defer allocator.free(sig);
                             try out.print(allocator, "      <arg name=\"arg{d}\" type=\"{s}\" direction=\"in\"/>\n", .{ i, sig });

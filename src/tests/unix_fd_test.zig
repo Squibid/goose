@@ -2,14 +2,21 @@ const std = @import("std");
 const goose = @import("goose");
 const Connection = goose.Connection;
 const message = goose.message;
-const GUFd = goose.core.value.GUFd;
+const GUFd = goose.GUFd;
+const ResolvedFd = goose.ResolvedFd;
+const GStr = goose.core.value.GStr;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+fn sleep(ms: i64) void {
+    var req = std.posix.timespec{ .sec = 0, .nsec = ms * std.time.ns_per_ms };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+pub fn main(i: std.process.Init) !void {
+    const allocator = i.gpa;
 
     std.debug.print("=== Test Suite: Out-of-Band UNIX File Descriptor Transport (SCM_RIGHTS) ===\n", .{});
 
-    var conn = try Connection.init(allocator, .Session, init.io, init.environ_map);
+    var conn = try Connection.init(allocator, .Session, i.io, i.environ_map);
     defer conn.close();
 
     if (!conn.supports_unix_fd) {
@@ -92,8 +99,7 @@ pub fn main(init: std.process.Init) !void {
         var attempts: usize = 0;
         while (attempts < 100) : (attempts += 1) {
             if (tracker.received.load(.acquire) and tracker.matched.load(.acquire) and tracker.taken_fd.load(.acquire) >= 0) break;
-            var req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = std.os.linux.nanosleep(&req, null);
+            sleep(10);
         }
 
         if (!tracker.received.load(.acquire)) {
@@ -202,8 +208,7 @@ pub fn main(init: std.process.Init) !void {
         var attempts: usize = 0;
         while (attempts < 100) : (attempts += 1) {
             if (tracker.received.load(.acquire) and tracker.matched_a.load(.acquire) and tracker.matched_b.load(.acquire)) break;
-            var req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = std.os.linux.nanosleep(&req, null);
+            sleep(10);
         }
 
         if (!tracker.received.load(.acquire) or tracker.count.load(.acquire) != 2) {
@@ -269,13 +274,11 @@ pub fn main(init: std.process.Init) !void {
         var attempts: usize = 0;
         while (attempts < 100) : (attempts += 1) {
             if (tracker.done.load(.acquire)) break;
-            var req = std.os.linux.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-            _ = std.os.linux.nanosleep(&req, null);
+            sleep(10);
         }
 
         // Give dispatchLoop a tiny slice to finish dispatchUnsolicited and defer freeMessage
-        var req = std.os.linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
-        _ = std.os.linux.nanosleep(&req, null);
+        sleep(20);
 
         const closed_fd = tracker.recorded_fd.load(.acquire);
         if (closed_fd < 0) return error.AutoCloseSignalNotReceived;
@@ -289,6 +292,248 @@ pub fn main(init: std.process.Init) !void {
         } else |err| {
             std.debug.print("PASS: Untaken FD ({d}) was cleanly closed ({any}).\n", .{ closed_fd, err });
         }
+    }
+
+    // -------------------------------------------------------------
+    // Test 4: ResolvedFd and []ResolvedFd Decoding and duplicate()
+    // -------------------------------------------------------------
+    std.debug.print("\n--- Subtest 4: ResolvedFd and []ResolvedFd Decoding and duplicate() ---\n", .{});
+    {
+        // 4.1 Single ResolvedFd decoding & duplicate()
+        var p1: [2]std.posix.fd_t = undefined;
+        _ = std.posix.system.pipe(&p1);
+        defer _ = std.posix.system.close(p1[1]);
+
+        _ = std.posix.system.write(p1[1], "resolved-fd-single", 18);
+
+        var enc1 = try message.BodyEncoder.encode(allocator, GUFd.new(0));
+        defer enc1.deinit();
+
+        var dec1 = message.BodyDecoder.initWithFds(allocator, enc1.body(), enc1.signature(), .little, &.{p1[0]});
+        const rfd = try dec1.decode(ResolvedFd);
+        if (rfd.index != 0 or rfd.handle != p1[0]) return error.ResolvedFdMismatch;
+
+        // Duplicate the descriptor
+        const dup_fd = try rfd.duplicate();
+        defer _ = std.posix.system.close(dup_fd);
+
+        if (dup_fd == rfd.handle) return error.DuplicateSameHandle;
+
+        // Close original read handle; duplicate must remain valid
+        _ = std.posix.system.close(p1[0]);
+
+        var read_buf: [32]u8 = undefined;
+        const n = try std.posix.read(dup_fd, &read_buf);
+        if (!std.mem.eql(u8, read_buf[0..n], "resolved-fd-single")) {
+            return error.PayloadMismatchAfterDup;
+        }
+
+        // Verify FD_CLOEXEC is set on duplicated handle
+        const flags = std.posix.system.fcntl(dup_fd, std.posix.F.GETFD, 0);
+        if ((flags & std.posix.FD_CLOEXEC) == 0) return error.CloexecNotSet;
+
+        std.debug.print("PASS: ResolvedFd decoded and duplicate() preserved data with O_CLOEXEC.\n", .{});
+
+        // 4.2 Array of ResolvedFd ([]ResolvedFd) decoding
+        var pa: [2]std.posix.fd_t = undefined;
+        var pb: [2]std.posix.fd_t = undefined;
+        _ = std.posix.system.pipe(&pa);
+        _ = std.posix.system.pipe(&pb);
+        defer _ = std.posix.system.close(pa[1]);
+        defer _ = std.posix.system.close(pb[1]);
+        defer _ = std.posix.system.close(pa[0]);
+        defer _ = std.posix.system.close(pb[0]);
+
+        _ = std.posix.system.write(pa[1], "elem-a", 6);
+        _ = std.posix.system.write(pb[1], "elem-b", 6);
+
+        const rfds_to_encode = [_]ResolvedFd{
+            ResolvedFd.init(pa[0], 0),
+            ResolvedFd.init(pb[0], 1),
+        };
+        var enc_arr = try message.BodyEncoder.encode(allocator, &rfds_to_encode);
+        defer enc_arr.deinit();
+
+        var dec_arr = message.BodyDecoder.initWithFds(allocator, enc_arr.body(), enc_arr.signature(), .little, &.{ pa[0], pb[0] });
+        const decoded_slice = try dec_arr.decode([]ResolvedFd);
+        defer allocator.free(decoded_slice);
+
+        if (decoded_slice.len != 2) return error.ArrayLenMismatch;
+        if (decoded_slice[0].handle != pa[0] or decoded_slice[1].handle != pb[0]) return error.ArrayHandleMismatch;
+
+        var buf_a: [16]u8 = undefined;
+        var buf_b: [16]u8 = undefined;
+        const na = try std.posix.read(decoded_slice[0].handle, &buf_a);
+        const nb = try std.posix.read(decoded_slice[1].handle, &buf_b);
+        if (!std.mem.eql(u8, buf_a[0..na], "elem-a") or !std.mem.eql(u8, buf_b[0..nb], "elem-b")) {
+            return error.ArrayPayloadMismatch;
+        }
+
+        std.debug.print("PASS: []ResolvedFd decoded successfully with multiple handles.\n", .{});
+    }
+
+    // -------------------------------------------------------------
+    // Test 5: D-Bus Object Method Dispatch with ResolvedFd and []ResolvedFd
+    // -------------------------------------------------------------
+    std.debug.print("\n--- Subtest 5: Object Method Dispatch with ResolvedFd & []ResolvedFd ---\n", .{});
+    {
+        const FdServiceTracker = struct {
+            received_text: [64]u8 = undefined,
+            received_len: usize = 0,
+            duplicated_fd: std.posix.fd_t = -1,
+            list_total_bytes: usize = 0,
+            single_done: std.atomic.Value(bool) = .init(false),
+            list_done: std.atomic.Value(bool) = .init(false),
+        };
+
+        const FdReceiverService = struct {
+            pub const INTERFACE_NAME = "dev.goose.test.FdReceiver";
+
+            tracker: *FdServiceTracker,
+
+            pub fn init(_: *Connection, tracker: *FdServiceTracker) @This() {
+                return .{ .tracker = tracker };
+            }
+
+            pub fn ReceiveFd(self: *@This(), label: GStr, rfd: ResolvedFd) !u32 {
+                _ = label;
+                var buf: [64]u8 = undefined;
+                const n = try std.posix.read(rfd.handle, &buf);
+                @memcpy(self.tracker.received_text[0..n], buf[0..n]);
+                self.tracker.received_len = n;
+
+                // Duplicate descriptor to persist beyond method lifetime
+                self.tracker.duplicated_fd = try rfd.duplicate();
+                self.tracker.single_done.store(true, .release);
+                return 42;
+            }
+
+            pub fn ReceiveFdList(self: *@This(), rfds: []ResolvedFd) !u32 {
+                var total: usize = 0;
+                for (rfds) |rfd| {
+                    var buf: [32]u8 = undefined;
+                    const n = try std.posix.read(rfd.handle, &buf);
+                    total += n;
+                }
+                self.tracker.list_total_bytes = total;
+                self.tracker.list_done.store(true, .release);
+                return @intCast(total);
+            }
+        };
+
+        var tracker = FdServiceTracker{};
+        try conn.registerObject(FdReceiverService, "dev.goose.test.FdReceiver", "/dev/goose/test/FdReceiver", &tracker);
+
+        // Introspection verification
+        var intro_reply = try conn.methodCall(
+            "dev.goose.test.FdReceiver",
+            "/dev/goose/test/FdReceiver",
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            null,
+            "",
+        );
+        defer conn.freeMessage(&intro_reply);
+
+        var intro_dec = message.BodyDecoder.fromMessage(allocator, intro_reply);
+        const intro_str = try intro_dec.decode(GStr);
+        if (std.mem.indexOf(u8, intro_str.s, "<arg name=\"arg1\" type=\"h\" direction=\"in\"/>") == null) {
+            std.debug.print("FAIL: Introspection XML missing ResolvedFd 'h' argument!\n{s}\n", .{intro_str.s});
+            return error.IntrospectMissingFdArg;
+        }
+        if (std.mem.indexOf(u8, intro_str.s, "<arg name=\"arg0\" type=\"ah\" direction=\"in\"/>") == null) {
+            std.debug.print("FAIL: Introspection XML missing []ResolvedFd 'ah' argument!\n{s}\n", .{intro_str.s});
+            return error.IntrospectMissingFdListArg;
+        }
+        std.debug.print("PASS: Object Introspection XML validates 'h' and 'ah' signatures.\n", .{});
+
+        // 5.1 Call ReceiveFd(label: GStr, rfd: ResolvedFd)
+        var p_call: [2]std.posix.fd_t = undefined;
+        _ = std.posix.system.pipe(&p_call);
+        defer _ = std.posix.system.close(p_call[1]);
+
+        _ = std.posix.system.write(p_call[1], "dispatch-fd-payload", 19);
+
+        var call_enc = try message.BodyEncoder.encode(allocator, .{ GStr.new("upload"), ResolvedFd.init(p_call[0], 0) });
+        defer call_enc.deinit();
+
+        const call_fds = [_]std.posix.fd_t{p_call[0]};
+        var reply = try conn.methodCallWithFds(
+            "dev.goose.test.FdReceiver",
+            "/dev/goose/test/FdReceiver",
+            "dev.goose.test.FdReceiver",
+            "ReceiveFd",
+            call_enc.signature(),
+            call_enc.body(),
+            &call_fds,
+        );
+        defer conn.freeMessage(&reply);
+        _ = std.posix.system.close(p_call[0]);
+
+        var reply_dec = message.BodyDecoder.fromMessage(allocator, reply);
+        const ret_val = try reply_dec.decode(u32);
+        if (ret_val != 42) return error.InvalidMethodReturn;
+
+        if (!tracker.single_done.load(.acquire)) return error.MethodNotExecuted;
+        if (!std.mem.eql(u8, tracker.received_text[0..tracker.received_len], "dispatch-fd-payload")) {
+            return error.DispatchedPayloadMismatch;
+        }
+
+        // Verify the duplicated descriptor is still alive after method return and original fd closure
+        const dup_handle = tracker.duplicated_fd;
+        if (dup_handle < 0) return error.DuplicatedFdInvalid;
+        defer _ = std.posix.system.close(dup_handle);
+
+        _ = std.posix.system.write(p_call[1], "+more-data", 10);
+        var extra_buf: [16]u8 = undefined;
+        const n_extra = try std.posix.read(dup_handle, &extra_buf);
+        if (!std.mem.eql(u8, extra_buf[0..n_extra], "+more-data")) {
+            return error.DuplicatedFdReadMismatch;
+        }
+        std.debug.print("PASS: ReceiveFd executed, returned 42, and duplicated FD outlived method call.\n", .{});
+
+        // 5.2 Call ReceiveFdList(rfds: []ResolvedFd)
+        var p_list1: [2]std.posix.fd_t = undefined;
+        var p_list2: [2]std.posix.fd_t = undefined;
+        _ = std.posix.system.pipe(&p_list1);
+        _ = std.posix.system.pipe(&p_list2);
+        defer _ = std.posix.system.close(p_list1[1]);
+        defer _ = std.posix.system.close(p_list2[1]);
+
+        _ = std.posix.system.write(p_list1[1], "12345", 5);
+        _ = std.posix.system.write(p_list2[1], "67890!", 6);
+
+        const list_args = [_]ResolvedFd{
+            ResolvedFd.init(p_list1[0], 0),
+            ResolvedFd.init(p_list2[0], 1),
+        };
+        var list_enc = try message.BodyEncoder.encode(allocator, .{list_args[0..]});
+        defer list_enc.deinit();
+
+        const list_fds = [_]std.posix.fd_t{ p_list1[0], p_list2[0] };
+        var list_reply = try conn.methodCallWithFds(
+            "dev.goose.test.FdReceiver",
+            "/dev/goose/test/FdReceiver",
+            "dev.goose.test.FdReceiver",
+            "ReceiveFdList",
+            list_enc.signature(),
+            list_enc.body(),
+            &list_fds,
+        );
+        defer conn.freeMessage(&list_reply);
+        _ = std.posix.system.close(p_list1[0]);
+        _ = std.posix.system.close(p_list2[0]);
+
+        var list_reply_dec = message.BodyDecoder.fromMessage(allocator, list_reply);
+        const list_ret = try list_reply_dec.decode(u32);
+        if (list_ret != 11) {
+            std.debug.print("FAIL: Expected total 11 bytes, got {d}\n", .{list_ret});
+            return error.InvalidListReturn;
+        }
+
+        if (!tracker.list_done.load(.acquire)) return error.ListMethodNotExecuted;
+        if (tracker.list_total_bytes != 11) return error.ListTotalMismatch;
+        std.debug.print("PASS: ReceiveFdList executed successfully and read from multiple passed FDs.\n", .{});
     }
 
     std.debug.print("\nAll UNIX FD passing tests passed successfully!\n", .{});
